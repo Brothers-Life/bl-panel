@@ -1,0 +1,152 @@
+/* Brothers Life — panel staff. HUD sombre, or du logo, braise pour le danger. */
+:root {
+  --bg: #141015;
+  --surface: #1d171e;
+  --surface2: #241c25;
+  --line: #2e2630;
+  --ink: #efe7da;
+  --ink-dim: #9d8f91;
+  --gold: #e8a33d;
+  --ember: #d4572e;
+  --jade: #6fbf8e;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 "Archivo", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+.hidden { display: none !important; }
+a { color: var(--gold); text-decoration: none; }
+
+/* ------------------------------- connexion ------------------------------- */
+.login { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+.login-box {
+  width: 340px; max-width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--gold);
+  padding: 32px 28px;
+  display: flex; flex-direction: column; gap: 12px; align-items: flex-start;
+}
+.login-box h1 { margin: 4px 0 0; font-size: 22px; font-stretch: 115%; font-weight: 800; }
+.login-box p { margin: 0 0 8px; color: var(--ink-dim); font-size: 13px; }
+.login-box input {
+  width: 100%; padding: 10px 12px;
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 4px; font: inherit;
+}
+.login-box button {
+  width: 100%; padding: 10px;
+  background: var(--gold); color: #241a07;
+  font: inherit; font-weight: 800; border: 0; border-radius: 4px; cursor: pointer;
+}
+.login-box button:hover { filter: brightness(1.08); }
+.login-error { color: var(--ember); font-size: 13px; min-height: 1em; }
+
+/* --------------------------------- layout -------------------------------- */
+.app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+.side {
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  display: flex; flex-direction: column;
+  position: sticky; top: 0; height: 100vh;
+}
+.brand { display: flex; gap: 10px; align-items: center; padding: 18px 16px; border-bottom: 1px solid var(--line); }
+.brand strong { display: block; font-stretch: 115%; font-weight: 800; letter-spacing: .2px; }
+.brand span { color: var(--ink-dim); font-size: 12px; }
+#nav { display: flex; flex-direction: column; padding: 12px 0; }
+#nav a {
+  padding: 10px 16px; color: var(--ink-dim);
+  border-left: 3px solid transparent;
+}
+#nav a:hover { color: var(--ink); }
+#nav a.active { color: var(--ink); border-left-color: var(--gold); background: var(--surface2); }
+.side-status { margin-top: auto; padding: 14px 16px; border-top: 1px solid var(--line); font-size: 13px; color: var(--ink-dim); }
+.side-players { margin-top: 2px; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--ink-dim); vertical-align: baseline; }
+.dot.up { background: var(--jade); }
+.dot.down { background: var(--ember); }
+
+#main { padding: 28px 32px 60px; min-width: 0; }
+.page > h2, .grid2 h2 { font-size: 15px; font-weight: 700; margin: 28px 0 8px; color: var(--ink); }
+.back { display: inline-block; margin-bottom: 14px; color: var(--ink-dim); }
+.back:hover { color: var(--gold); }
+
+/* ------------------------------ bloc HUD héro ----------------------------- */
+.hud {
+  display: grid; grid-template-columns: auto 1fr auto; gap: 28px; align-items: end;
+  padding: 22px 24px;
+  background: linear-gradient(180deg, var(--surface2), var(--surface));
+  border: 1px solid var(--line); border-top: 3px solid var(--gold);
+  margin-bottom: 24px;
+}
+.hud-number {
+  font-size: 84px; line-height: .9; font-weight: 900; font-stretch: 125%;
+  color: var(--gold);
+}
+.hud-name { font-size: 40px; line-height: 1; font-weight: 900; font-stretch: 120%; color: var(--gold); }
+.hud-label { color: var(--ink-dim); margin-top: 6px; }
+.hud-bars { display: flex; gap: 4px; align-items: flex-end; height: 72px; overflow: hidden; }
+.hud-bars i {
+  width: 7px; background: var(--line); display: block; border-radius: 1px;
+  min-height: 4px;
+}
+.hud-bars i.on { background: var(--gold); }
+.hud-side { font-size: 14px; color: var(--ink-dim); display: grid; gap: 4px; justify-items: start; }
+.hud-side b { color: var(--ink); font-weight: 700; }
+
+/* -------------------------------- figures -------------------------------- */
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+figure { margin: 0 0 20px; background: var(--surface); border: 1px solid var(--line); padding: 14px 16px 10px; min-width: 0; }
+figure.wide { grid-column: 1 / -1; }
+figure canvas { width: 100% !important; height: 220px !important; }
+figure.slim canvas { height: 140px !important; }
+figcaption { font-size: 13px; color: var(--ink-dim); margin-bottom: 8px; }
+
+/* --------------------------------- tables -------------------------------- */
+.t { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.t th {
+  text-align: left; font-weight: 600; color: var(--ink-dim);
+  padding: 7px 10px; border-bottom: 1px solid var(--gold);
+}
+.t td { padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.t tr:hover td { background: var(--surface2); }
+.t .r, .t td.r { text-align: right; }
+.t.mono td { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+.t a { font-weight: 600; }
+.t img.icon { width: 24px; height: 24px; object-fit: contain; display: block; }
+.lvl-error { color: var(--ember); font-weight: 700; }
+.lvl-warn { color: var(--gold); }
+.neg { color: var(--ember); }
+.pos { color: var(--jade); }
+
+/* ------------------------------- recherche ------------------------------- */
+.searchrow { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; }
+.searchrow input, .searchrow select {
+  padding: 9px 12px; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 4px; font: inherit;
+}
+.searchrow input[type="search"] { flex: 1; max-width: 420px; }
+.searchrow span { color: var(--ink-dim); font-size: 13px; }
+
+/* -------------------------------- mobile --------------------------------- */
+@media (max-width: 900px) {
+  .app { grid-template-columns: 1fr; }
+  .side { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }
+  #nav { flex-direction: row; flex-wrap: wrap; }
+  .side-status { margin: 0 0 0 auto; border: 0; }
+  #main { padding: 16px; }
+  .grid2 { grid-template-columns: 1fr; }
+  .hud { grid-template-columns: 1fr; gap: 14px; }
+  .hud-number { font-size: 56px; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .hud-bars i { transition: height .4s ease, background-color .4s ease; }
+}
+
+:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }

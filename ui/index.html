@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brothers Life — Panel</title>
+<link rel="icon" href="logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Connexion -->
+<div id="login" class="login hidden">
+  <form id="loginForm" class="login-box">
+    <img src="logo.png" alt="Brothers Life" width="72" height="72">
+    <h1>Panel Brothers Life</h1>
+    <p>Réservé au staff. Entre le mot de passe du panel.</p>
+    <input id="password" type="password" placeholder="Mot de passe" autocomplete="current-password" autofocus>
+    <button type="submit">Entrer</button>
+    <div id="loginError" class="login-error"></div>
+  </form>
+</div>
+
+<!-- Application -->
+<div id="app" class="app hidden">
+  <aside class="side">
+    <div class="brand">
+      <img src="logo.png" alt="" width="44" height="44">
+      <div>
+        <strong>Brothers Life</strong>
+        <span>panel serveur</span>
+      </div>
+    </div>
+    <nav id="nav">
+      <a href="#overview" data-page="overview" class="active">Vue d'ensemble</a>
+      <a href="#economy" data-page="economy">Économie</a>
+      <a href="#players" data-page="players">Joueurs</a>
+      <a href="#logs" data-page="logs">Logs</a>
+      <a href="#admin" data-page="admin">Staff &amp; sécurité</a>
+    </nav>
+    <div class="side-status">
+      <div><span id="statusDot" class="dot"></span> <span id="statusText">serveur…</span></div>
+      <div id="statusPlayers" class="side-players"></div>
+    </div>
+  </aside>
+
+  <main id="main">
+
+    <section id="page-overview" class="page">
+      <div class="hud">
+        <div class="hud-count">
+          <div id="hudOnline" class="hud-number">–</div>
+          <div class="hud-label">joueurs en ligne <span id="hudMax"></span></div>
+        </div>
+        <div class="hud-bars" id="hudBars"></div>
+        <div class="hud-side">
+          <div><b id="kChars">–</b> personnages créés</div>
+          <div><b id="kSessions">–</b> connexions sur 24 h</div>
+          <div><b id="kDeaths">–</b> morts sur 24 h</div>
+          <div><b id="kEvents">–</b> événements sur 24 h</div>
+        </div>
+      </div>
+      <div class="grid2">
+        <figure><figcaption>Joueurs en ligne — 24 h</figcaption><canvas id="chOnline"></canvas></figure>
+        <figure><figcaption>Tick serveur par thread (ms)</figcaption><canvas id="chTick"></canvas></figure>
+      </div>
+      <h2>Dernières erreurs console</h2>
+      <table class="t" id="tErrors"><thead><tr><th>Heure</th><th>Canal</th><th>Message</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-economy" class="page hidden">
+      <div class="grid2">
+        <figure class="wide"><figcaption>Masse monétaire (cash + banque)</figcaption><canvas id="chMass"></canvas></figure>
+        <figure><figcaption>Flux bancaires par heure</figcaption><canvas id="chFlows"></canvas></figure>
+        <figure><figcaption>Chiffre d'affaires par boutique</figcaption><canvas id="chShops"></canvas></figure>
+      </div>
+      <div class="grid2">
+        <div>
+          <h2>Top fortunes</h2>
+          <table class="t" id="tTop"><thead><tr><th>Joueur</th><th class="r">Cash</th><th class="r">Banque</th><th class="r">Total</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div>
+          <h2>Derniers flux bancaires</h2>
+          <table class="t" id="tFlows"><thead><tr><th>Heure</th><th>Type</th><th>De</th><th>Vers</th><th class="r">Montant</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+      <h2>Derniers achats</h2>
+      <table class="t" id="tPurchases"><thead><tr><th>Heure</th><th>Joueur</th><th>Boutique</th><th>Article</th><th class="r">Qté</th><th class="r">Total</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-players" class="page hidden">
+      <div class="searchrow">
+        <input id="playerSearch" type="search" placeholder="Nom ou citizenid…">
+        <span id="playerCount"></span>
+      </div>
+      <table class="t" id="tPlayers"><thead><tr><th>Joueur</th><th>Citizenid</th><th>Métier</th><th>Gang</th><th class="r">Cash</th><th class="r">Banque</th><th>Vu le</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-player" class="page hidden">
+      <a href="#players" class="back">← Retour aux joueurs</a>
+      <div class="hud">
+        <div class="hud-count">
+          <div id="pName" class="hud-name">–</div>
+          <div class="hud-label" id="pMeta">–</div>
+        </div>
+        <div class="hud-side">
+          <div><b id="pHours">–</b> heures de jeu</div>
+          <div><b id="pDeaths">–</b> morts</div>
+          <div><b id="pPurchases">–</b> achats</div>
+          <div><b id="pMoney">–</b> sur lui + banque</div>
+        </div>
+      </div>
+      <figure class="wide"><figcaption>Argent sur 30 jours</figcaption><canvas id="chPlayerMoney"></canvas></figure>
+      <div class="grid2">
+        <div>
+          <h2>Inventaire</h2>
+          <table class="t" id="tInv"><thead><tr><th></th><th>Objet</th><th class="r">Quantité</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div>
+          <h2>Véhicules</h2>
+          <table class="t" id="tVeh"><thead><tr><th>Plaque</th><th>Modèle</th><th>Garage</th><th>État</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+      <div class="grid2">
+        <div>
+          <h2>Morts</h2>
+          <table class="t" id="tPDeaths"><thead><tr><th>Heure</th><th>Cause</th><th>Tueur</th><th>Arme</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div>
+          <h2>Sessions</h2>
+          <table class="t" id="tPSessions"><thead><tr><th>Début</th><th>Fin</th><th class="r">Minutes</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+      <div class="grid2">
+        <div>
+          <h2>Flux bancaires</h2>
+          <table class="t" id="tPFlows"><thead><tr><th>Heure</th><th>Type</th><th>Avec</th><th class="r">Montant</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div>
+          <h2>Achats</h2>
+          <table class="t" id="tPPurchases"><thead><tr><th>Heure</th><th>Boutique</th><th>Article</th><th class="r">Total</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+      <h2>Derniers événements</h2>
+      <table class="t" id="tPEvents"><thead><tr><th>Heure</th><th>Type</th><th>Détails</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-logs" class="page hidden">
+      <figure class="wide slim"><figcaption>Volume de logs — 6 h</figcaption><canvas id="chLogVolume"></canvas></figure>
+      <div class="searchrow">
+        <input id="logSearch" type="search" placeholder="Rechercher dans la console…">
+        <select id="logLevel">
+          <option value="">Tous niveaux</option>
+          <option value="info">info</option>
+          <option value="warn">warn</option>
+          <option value="error">error</option>
+        </select>
+      </div>
+      <table class="t mono" id="tLogs"><thead><tr><th>Heure</th><th>Canal</th><th>Niveau</th><th>Message</th></tr></thead><tbody></tbody></table>
+      <h2>Chat et commandes</h2>
+      <table class="t" id="tChat"><thead><tr><th>Heure</th><th>Joueur</th><th>Type</th><th>Message</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-admin" class="page hidden">
+      <figure class="wide slim"><figcaption>Morts par heure — 7 jours</figcaption><canvas id="chDeaths"></canvas></figure>
+      <h2>Actions staff</h2>
+      <table class="t" id="tActions"><thead><tr><th>Heure</th><th>Action</th><th>Staff</th><th>Cible</th><th>Raison</th><th>Durée</th></tr></thead><tbody></tbody></table>
+      <div class="grid2">
+        <div>
+          <h2>Dernières connexions</h2>
+          <table class="t" id="tConn"><thead><tr><th>Début</th><th>Joueur</th><th>Fin</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div>
+          <h2>Explosions</h2>
+          <table class="t" id="tExpl"><thead><tr><th>Heure</th><th>Joueur</th><th>Type</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
