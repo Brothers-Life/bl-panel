@@ -52,8 +52,9 @@ function readBody(req) {
   });
 }
 
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 function json(res, code, obj) {
-  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': CORS_ORIGIN });
   res.end(JSON.stringify(obj));
 }
 
@@ -299,6 +300,10 @@ function serveStatic(res, urlPath) {
 const server = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
   try {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { 'Access-Control-Allow-Origin': CORS_ORIGIN, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Max-Age': '86400' });
+      return res.end();
+    }
     if (req.method === 'GET' && url === '/health') return json(res, 200, { ok: true, lastScrapeOk });
 
     if (req.method === 'POST' && url === '/v1/batch') {
@@ -326,9 +331,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 404, { error: 'inconnu' });
     }
 
-    if (req.method === 'GET' && serveStatic(res, url)) return;
-    // SPA fallback
-    if (req.method === 'GET' && serveStatic(res, '/')) return;
+    if (req.method === 'GET' && url === '/') return json(res, 200, { service: 'bl-panel-api', ok: true });
     json(res, 404, { error: 'not found' });
   } catch (e) {
     console.error('req error:', e.message);
