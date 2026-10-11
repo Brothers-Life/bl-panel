@@ -4,7 +4,9 @@
  *  - POST /v1/batch           : ingestion FiveM (Bearer INGEST_TOKEN)
  *  - GET  /api/*              : stats pour le site (session cookie apres /api/login)
  *  - GET  /                   : site (public/)
+ *  - GET  /api/stream         : flux temps reel (Server-Sent Events)
  *  - Scraper /perf/ + /dynamic.json toutes les 15 s, retention RETENTION_DAYS.
+ *  - Moteur d'alertes (serveur tombe, rafale d'erreurs, anticheat, saut d'argent) -> table alerts + Discord.
  */
 const http = require('http');
 const fs = require('fs');
@@ -19,6 +21,12 @@ const FIVEM_BASE = (process.env.FIVEM_BASE || '').replace(/\/$/, '');
 const SCRAPE_INTERVAL_MS = parseInt(process.env.SCRAPE_INTERVAL_MS || '15000', 10);
 const RETENTION_DAYS = parseInt(process.env.RETENTION_DAYS || '365', 10);
 const MAX_BODY = 5 * 1024 * 1024;
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
+const ALERT_INTERVAL_MS = parseInt(process.env.ALERT_INTERVAL_MS || '60000', 10);
+const ALERT_ERRORS_5MIN = parseInt(process.env.ALERT_ERRORS_5MIN || '25', 10);
+const ALERT_MONEY_JUMP = parseInt(process.env.ALERT_MONEY_JUMP || '1000000', 10);
+const ALERT_ANTICHEAT_CHANNEL = process.env.ALERT_ANTICHEAT_CHANNEL || 'anticheat';
+const PANEL_TZ = process.env.PANEL_TZ || 'Europe/Paris';
 
 if (!TOKEN) {
   console.error('INGEST_TOKEN manquant — refus de demarrer.');
@@ -182,9 +190,167 @@ async function scrapeOnce() {
 }
 
 async function purgeOld() {
-  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned']) {
+  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned', 'alerts']) {
     await q(`DELETE FROM ${t} WHERE ts < now() - interval '${RETENTION_DAYS} days'`);
   }
+}
+
+/* -------------------------------- alertes -------------------------------- */
+
+const SEVERITY_COLOR = { critical: 0xf43f5e, warn: 0xfbbf24, info: 0x8b7bff, ok: 0x34d399 };
+const fmtMoney = (v) => new Intl.NumberFormat('fr-FR').format(Math.round(Number(v) || 0)) + ' $';
+const stripColors = (s) => String(s ?? '').replace(/\^\d/g, '');
+
+async function notifyDiscord(alert) {
+  if (!DISCORD_WEBHOOK_URL) return false;
+  try {
+    const r = await fetch(DISCORD_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'Brothers Life — Panel',
+        embeds: [{
+          title: alert.title.slice(0, 250),
+          description: (alert.detail || '').slice(0, 2000),
+          color: SEVERITY_COLOR[alert.severity] || SEVERITY_COLOR.warn,
+          timestamp: new Date().toISOString(),
+          footer: { text: alert.kind },
+        }],
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    return r.ok;
+  } catch (e) {
+    console.error('discord:', e.message);
+    return false;
+  }
+}
+
+async function raiseAlert(kind, severity, title, detail, citizenid = null, data = {}) {
+  const r = await q('INSERT INTO alerts (kind, severity, title, detail, citizenid, data) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+    [kind, severity, title, detail, citizenid, JSON.stringify(data)]);
+  const id = r.rows[0]?.id;
+  if (id && await notifyDiscord({ kind, severity, title, detail })) await q('UPDATE alerts SET notified = true WHERE id = $1', [id]);
+}
+
+const alertState = { serverDown: null, lastErrorBurst: 0, lastLogId: null, lastMoneyCheck: null, moneyCooldown: new Map() };
+
+async function checkAlerts() {
+  // 1) Serveur tombé / revenu : deux relevés consécutifs pour confirmer
+  const up = await q(`SELECT value FROM perf_metrics WHERE metric='server_up' ORDER BY ts DESC LIMIT 2`);
+  if (up.rows.length === 2) {
+    const down = up.rows.every((r) => Number(r.value) === 0);
+    const back = Number(up.rows[0].value) === 1;
+    if (alertState.serverDown === null) alertState.serverDown = down;
+    else if (down && !alertState.serverDown) {
+      alertState.serverDown = true;
+      await raiseAlert('server_down', 'critical', 'Serveur injoignable', 'Le serveur FiveM ne répond plus aux deux derniers relevés.');
+    } else if (back && alertState.serverDown) {
+      alertState.serverDown = false;
+      await raiseAlert('server_up', 'ok', 'Serveur de nouveau en ligne', 'Le serveur FiveM répond à nouveau.');
+    }
+  }
+
+  // 2) Rafale d'erreurs console (cooldown 15 min)
+  if (Date.now() - alertState.lastErrorBurst > 15 * 60e3) {
+    const e = await q(`SELECT COUNT(*)::int AS n, (array_agg(DISTINCT channel))[1:5] AS channels FROM server_logs WHERE level='error' AND ts > now() - interval '5 minutes'`);
+    const n = e.rows[0]?.n || 0;
+    if (n >= ALERT_ERRORS_5MIN) {
+      alertState.lastErrorBurst = Date.now();
+      await raiseAlert('error_burst', 'warn', `${n} erreurs console en 5 minutes`, 'Canaux : ' + (e.rows[0].channels || []).filter(Boolean).join(', '), null, { n });
+    }
+  }
+
+  // 3) Anticheat : nouvelles lignes warn/error sur le canal anticheat
+  if (alertState.lastLogId === null) {
+    alertState.lastLogId = Number((await q('SELECT COALESCE(MAX(id),0) AS id FROM server_logs')).rows[0]?.id || 0);
+  } else {
+    const ac = await q(`SELECT id, ts, channel, level, line FROM server_logs WHERE id > $1 AND channel ILIKE $2 AND level IN ('warn','error') ORDER BY id LIMIT 50`,
+      [alertState.lastLogId, '%' + ALERT_ANTICHEAT_CHANNEL + '%']);
+    const maxId = await q('SELECT COALESCE(MAX(id),0) AS id FROM server_logs');
+    alertState.lastLogId = Number(maxId.rows[0]?.id || alertState.lastLogId);
+    const lines = ac.rows.map((r) => stripColors(r.line).trim());
+    if (lines.length === 1) await raiseAlert('anticheat', 'critical', 'Anticheat', lines[0]);
+    else if (lines.length > 1) await raiseAlert('anticheat', 'critical', `Anticheat : ${lines.length} détections`, lines.slice(0, 8).map((l) => '• ' + l.slice(0, 200)).join('\n'), null, { n: lines.length });
+  }
+
+  // 4) Saut d'argent anormal entre deux snapshots d'un même joueur (cooldown 30 min / joueur)
+  const since = alertState.lastMoneyCheck || new Date(Date.now() - ALERT_INTERVAL_MS);
+  alertState.lastMoneyCheck = new Date();
+  const jumps = await q(`
+    WITH s AS (
+      SELECT citizenid, name, ts, COALESCE(cash,0)+COALESCE(bank,0) AS total,
+             lag(COALESCE(cash,0)+COALESCE(bank,0)) OVER (PARTITION BY citizenid ORDER BY ts) AS prev
+      FROM player_snapshots WHERE ts > $1::timestamptz - interval '2 hours')
+    SELECT citizenid, name, ts, prev, total, total - prev AS jump FROM s
+    WHERE ts > $1 AND prev IS NOT NULL AND total - prev >= $2 ORDER BY jump DESC LIMIT 20`, [since, ALERT_MONEY_JUMP]);
+  for (const j of jumps.rows) {
+    const last = alertState.moneyCooldown.get(j.citizenid) || 0;
+    if (Date.now() - last < 30 * 60e3) continue;
+    alertState.moneyCooldown.set(j.citizenid, Date.now());
+    await raiseAlert('money_jump', 'warn', `Saut d'argent : ${j.name || j.citizenid} +${fmtMoney(j.jump)}`,
+      `${fmtMoney(j.prev)} → ${fmtMoney(j.total)} (citizenid ${j.citizenid})`, j.citizenid, { prev: j.prev, total: j.total, jump: j.jump });
+  }
+}
+
+/* ------------------------------ temps reel (SSE) ------------------------------ */
+
+const streamClients = new Set();
+const streamCursor = { log: null, chat: null, session: null, death: null, alert: null };
+let streamTimer = null;
+
+async function maxId(table) { return Number((await q(`SELECT COALESCE(MAX(id),0) AS id FROM ${table}`)).rows[0]?.id || 0); }
+
+async function streamTick() {
+  if (!streamClients.size) return;
+  const c = streamCursor;
+  if (c.log === null) {
+    [c.log, c.chat, c.session, c.death, c.alert] = await Promise.all(['server_logs', 'events', 'sessions', 'deaths', 'alerts'].map(maxId));
+  }
+  // Les events (chat) avancent vite : on borne par le max global pour ne pas re-scanner ni rater de ligne
+  const lastEvent = await maxId('events');
+  const [logs, chat, sessions, deaths, alerts, status] = await Promise.all([
+    q('SELECT id, ts, channel, level, line FROM server_logs WHERE id > $1 ORDER BY id LIMIT 100', [c.log]),
+    q(`SELECT id, ts, player_name, citizenid, subtype, data->>'message' AS message FROM events WHERE id > $1 AND id <= $2 AND subtype IN ('chat','command') ORDER BY id LIMIT 100`, [c.chat, lastEvent]),
+    q('SELECT id, start_ts AS ts, player_name, citizenid FROM sessions WHERE id > $1 ORDER BY id LIMIT 50', [c.session]),
+    q('SELECT id, ts, player_name, citizenid, cause, killer_name, weapon FROM deaths WHERE id > $1 ORDER BY id LIMIT 50', [c.death]),
+    q('SELECT id, ts, kind, severity, title, detail FROM alerts WHERE id > $1 ORDER BY id LIMIT 20', [c.alert]),
+    q(`SELECT (SELECT value FROM perf_metrics WHERE metric='players_online' ORDER BY ts DESC LIMIT 1) AS online,
+              (SELECT value FROM perf_metrics WHERE metric='players_max' ORDER BY ts DESC LIMIT 1) AS max,
+              (SELECT value FROM perf_metrics WHERE metric='server_up' ORDER BY ts DESC LIMIT 1) AS up`),
+  ]);
+  if (logs.rows.length) c.log = Number(logs.rows[logs.rows.length - 1].id);
+  c.chat = chat.rows.length === 100 ? Number(chat.rows[99].id) : lastEvent;
+  if (sessions.rows.length) c.session = Number(sessions.rows[sessions.rows.length - 1].id);
+  if (deaths.rows.length) c.death = Number(deaths.rows[deaths.rows.length - 1].id);
+  if (alerts.rows.length) c.alert = Number(alerts.rows[alerts.rows.length - 1].id);
+  const payload = 'event: tick\ndata: ' + JSON.stringify({
+    status: status.rows[0] || {}, logs: logs.rows, chat: chat.rows, sessions: sessions.rows, deaths: deaths.rows, alerts: alerts.rows,
+  }) + '\n\n';
+  for (const res of streamClients) res.write(payload);
+}
+
+function openStream(req, res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Access-Control-Allow-Origin': CORS_ORIGIN,
+  });
+  res.write('retry: 5000\n: ok\n\n');
+  streamClients.add(res);
+  const ping = setInterval(() => res.write(': ping\n\n'), 20000);
+  if (!streamTimer) {
+    const tick = () => streamTick().catch((e) => console.error('stream:', e.message));
+    tick(); // fixe les curseurs tout de suite
+    streamTimer = setInterval(tick, 3000);
+  }
+  req.on('close', () => {
+    clearInterval(ping);
+    streamClients.delete(res);
+    if (!streamClients.size) { clearInterval(streamTimer); streamTimer = null; Object.keys(streamCursor).forEach((k) => { streamCursor[k] = null; }); }
+  });
 }
 
 /* ------------------------------- API stats ------------------------------- */
@@ -220,15 +386,17 @@ const api = {
   },
   async economy(url) {
     const h = hoursParam(url, 24 * 7);
-    const [mass, top, shops, purchases, flows, flowsByHour] = await Promise.all([
+    const [mass, top, shops, purchases, flows, flowsByHour, latest, extra] = await Promise.all([
       q(`SELECT extract(epoch FROM ts)*1000 AS t, total_cash, total_bank FROM economy_snapshots WHERE ts > now() - interval '${h} hours' ORDER BY ts`),
       q(`SELECT name, citizenid, cash, bank, cash+bank AS total FROM (SELECT DISTINCT ON (citizenid) citizenid, name, cash, bank FROM player_snapshots ORDER BY citizenid, ts DESC) t ORDER BY total DESC NULLS LAST LIMIT 20`),
       q(`SELECT COALESCE(shop,'?') AS shop, SUM(total) AS ca, COUNT(*) AS n FROM purchases WHERE ts > now() - interval '${h} hours' GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 15`),
       q(`SELECT ts, player_name, citizenid, shop, COALESCE(label,item) AS article, qty, total, currency FROM purchases ORDER BY ts DESC LIMIT 100`),
       q(`SELECT ts, data->>'kind' AS kind, data->>'from_cid' AS from_cid, data->>'to_cid' AS to_cid, (data->>'amount')::numeric AS amount, data->>'note' AS note FROM events WHERE subtype='bank_flow' ORDER BY ts DESC LIMIT 100`),
       q(`SELECT date_trunc('hour', ts) AS t, COALESCE(data->>'kind','?') AS kind, SUM((data->>'amount')::numeric) AS total FROM events WHERE subtype='bank_flow' AND ts > now() - interval '${h} hours' GROUP BY 1,2 ORDER BY 1`),
+      q(`SELECT ts, player_count, chars_total, total_cash, total_bank, total_crypto, society_total FROM economy_snapshots ORDER BY ts DESC LIMIT 1`),
+      q(`SELECT extract(epoch FROM date_trunc('hour', ts))*1000 AS t, AVG(total_crypto) AS crypto, AVG(society_total) AS society FROM economy_snapshots WHERE ts > now() - interval '${h} hours' GROUP BY 1 ORDER BY 1`),
     ]);
-    return { mass: mass.rows, top: top.rows, shops: shops.rows, purchases: purchases.rows, flows: flows.rows, flowsByHour: flowsByHour.rows };
+    return { mass: mass.rows, top: top.rows, shops: shops.rows, purchases: purchases.rows, flows: flows.rows, flowsByHour: flowsByHour.rows, latest: latest.rows[0] || {}, extra: extra.rows };
   },
   async players(url) {
     const s = (new URL(url, 'http://x').searchParams.get('q') || '').slice(0, 60);
@@ -243,7 +411,7 @@ const api = {
     const [ident, money, deaths, purchases, sessions, vehicles, inventory, events, flows, stats] = await Promise.all([
       q('SELECT name, citizenid, job, job_grade, gang, cash, bank, crypto, online, ts FROM player_snapshots WHERE citizenid=$1 ORDER BY ts DESC LIMIT 1', [cid]),
       q(`SELECT extract(epoch FROM ts)*1000 AS t, cash, bank FROM player_snapshots WHERE citizenid=$1 AND ts > now() - interval '30 days' ORDER BY ts`, [cid]),
-      q('SELECT ts, cause, killer_name, weapon FROM deaths WHERE citizenid=$1 ORDER BY ts DESC LIMIT 50', [cid]),
+      q('SELECT ts, cause, killer_name, killer_cid, weapon, x, y, z, screenshot_url FROM deaths WHERE citizenid=$1 ORDER BY ts DESC LIMIT 50', [cid]),
       q('SELECT ts, shop, COALESCE(label,item) AS article, qty, total FROM purchases WHERE citizenid=$1 ORDER BY ts DESC LIMIT 50', [cid]),
       q('SELECT start_ts, end_ts, ROUND(duration_min::numeric,1) AS minutes, drop_reason FROM sessions WHERE citizenid=$1 ORDER BY start_ts DESC LIMIT 50', [cid]),
       q('SELECT DISTINCT ON (plate) plate, model, garage, state FROM vehicles_owned WHERE citizenid=$1 ORDER BY plate, ts DESC', [cid]),
@@ -278,6 +446,66 @@ const api = {
       q(`SELECT date_trunc('hour', ts) AS t, COUNT(*) AS n FROM deaths WHERE ts > now() - interval '7 days' GROUP BY 1 ORDER BY 1`),
     ]);
     return { actions: actions.rows, connections: connections.rows, explosions: explosions.rows, deathsByHour: deathsByHour.rows };
+  },
+  async deathmap(url) {
+    const h = hoursParam(url, 24 * 7);
+    const [points, shots] = await Promise.all([
+      q(`SELECT ts, citizenid, player_name, cause, killer_cid, killer_name, weapon, x, y, z, screenshot_url
+         FROM deaths WHERE x IS NOT NULL AND y IS NOT NULL AND ts > now() - interval '${h} hours' ORDER BY ts DESC LIMIT 5000`),
+      q(`SELECT ts, citizenid, player_name, cause, killer_name, weapon, screenshot_url FROM deaths WHERE screenshot_url IS NOT NULL AND screenshot_url <> '' ORDER BY ts DESC LIMIT 40`),
+    ]);
+    return { points: points.rows, screenshots: shots.rows };
+  },
+  async anomalies(url) {
+    const p = new URL(url, 'http://x').searchParams;
+    const h = hoursParam(url, 24);
+    const min = Math.max(0, parseInt(p.get('min') || String(ALERT_MONEY_JUMP), 10) || 0);
+    const r = await q(`
+      WITH s AS (
+        SELECT citizenid, name, ts, COALESCE(cash,0)+COALESCE(bank,0) AS total,
+               lag(COALESCE(cash,0)+COALESCE(bank,0)) OVER (PARTITION BY citizenid ORDER BY ts) AS prev,
+               first_value(COALESCE(cash,0)+COALESCE(bank,0)) OVER (PARTITION BY citizenid ORDER BY ts) AS first_total,
+               row_number() OVER (PARTITION BY citizenid ORDER BY ts DESC) AS rn
+        FROM player_snapshots WHERE ts > now() - interval '${h} hours'),
+      j AS (SELECT DISTINCT ON (citizenid) citizenid, name, ts, prev, total, total - prev AS jump
+            FROM s WHERE prev IS NOT NULL ORDER BY citizenid, total - prev DESC),
+      n AS (SELECT citizenid, first_total, total AS last_total FROM s WHERE rn = 1)
+      SELECT j.citizenid, j.name, j.ts, j.prev, j.total, j.jump, n.first_total, n.last_total, n.last_total - n.first_total AS net
+      FROM j JOIN n USING (citizenid) WHERE j.jump >= $1 ORDER BY j.jump DESC LIMIT 100`, [min]);
+    return { min, hours: h, players: r.rows };
+  },
+  async alerts() {
+    const [list, byKind] = await Promise.all([
+      q('SELECT id, ts, kind, severity, title, detail, citizenid, notified FROM alerts ORDER BY ts DESC LIMIT 200'),
+      q(`SELECT kind, COUNT(*)::int AS n FROM alerts WHERE ts > now() - interval '24 hours' GROUP BY 1 ORDER BY 2 DESC`),
+    ]);
+    return {
+      alerts: list.rows, byKind: byKind.rows,
+      config: { discord: !!DISCORD_WEBHOOK_URL, errors5min: ALERT_ERRORS_5MIN, moneyJump: ALERT_MONEY_JUMP, anticheatChannel: ALERT_ANTICHEAT_CHANNEL },
+    };
+  },
+  async insights(url) {
+    const d = Math.min(Math.max(parseInt(new URL(url, 'http://x').searchParams.get('d') || '7', 10) || 7, 1), 90);
+    const tz = PANEL_TZ.replace(/[^A-Za-z_/+-]/g, '');
+    const [heat, jobs, gangs, killers, weapons, causes, peak, uptime] = await Promise.all([
+      q(`SELECT extract(isodow FROM ts AT TIME ZONE '${tz}')::int AS dow, extract(hour FROM ts AT TIME ZONE '${tz}')::int AS hour,
+                ROUND(AVG(value)::numeric, 1) AS avg, MAX(value) AS max
+         FROM perf_metrics WHERE metric='players_online' AND ts > now() - interval '${d} days' GROUP BY 1,2`),
+      q(`SELECT COALESCE(NULLIF(job,''),'aucun') AS name, COUNT(*)::int AS n, (COUNT(*) FILTER (WHERE online))::int AS online
+         FROM (SELECT DISTINCT ON (citizenid) job, online FROM player_snapshots ORDER BY citizenid, ts DESC) t GROUP BY 1 ORDER BY 2 DESC LIMIT 12`),
+      q(`SELECT gang AS name, COUNT(*)::int AS n, (COUNT(*) FILTER (WHERE online))::int AS online
+         FROM (SELECT DISTINCT ON (citizenid) gang, online FROM player_snapshots ORDER BY citizenid, ts DESC) t
+         WHERE gang IS NOT NULL AND gang NOT IN ('', 'none') GROUP BY 1 ORDER BY 2 DESC LIMIT 12`),
+      q(`SELECT killer_name AS name, MAX(killer_cid) AS citizenid, COUNT(*)::int AS n FROM deaths
+         WHERE killer_name IS NOT NULL AND killer_name <> '' AND ts > now() - interval '${d} days' GROUP BY 1 ORDER BY 3 DESC LIMIT 10`),
+      q(`SELECT weapon AS name, COUNT(*)::int AS n FROM deaths WHERE weapon IS NOT NULL AND weapon <> '' AND ts > now() - interval '${d} days' GROUP BY 1 ORDER BY 2 DESC LIMIT 10`),
+      q(`SELECT COALESCE(NULLIF(cause,''),'?') AS name, COUNT(*)::int AS n FROM deaths WHERE ts > now() - interval '${d} days' GROUP BY 1 ORDER BY 2 DESC LIMIT 8`),
+      q(`SELECT value AS n, ts FROM perf_metrics WHERE metric='players_online' AND ts > now() - interval '${d} days' ORDER BY value DESC, ts DESC LIMIT 1`),
+      q(`SELECT ROUND((100 * AVG(value) FILTER (WHERE ts > now() - interval '24 hours'))::numeric, 2) AS day,
+                ROUND((100 * AVG(value))::numeric, 2) AS period
+         FROM perf_metrics WHERE metric='server_up' AND ts > now() - interval '${d} days'`),
+    ]);
+    return { days: d, tz, heat: heat.rows, jobs: jobs.rows, gangs: gangs.rows, killers: killers.rows, weapons: weapons.rows, causes: causes.rows, peak: peak.rows[0] || null, uptime: uptime.rows[0] || {} };
   },
 };
 
@@ -325,6 +553,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && url === '/api/stream') return openStream(req, res);
+
     if (url.startsWith('/api/')) {
       const name = url.slice(5);
       if (api[name]) return json(res, 200, await api[name](req.url));
@@ -343,4 +573,5 @@ initSchema().then(() => {
   server.listen(PORT, () => console.log('bl-panel on :' + PORT));
   if (FIVEM_BASE) { scrapeOnce(); setInterval(scrapeOnce, SCRAPE_INTERVAL_MS); }
   purgeOld(); setInterval(purgeOld, 24 * 3600 * 1000);
+  setInterval(() => checkAlerts().catch((e) => console.error('alerts:', e.message)), ALERT_INTERVAL_MS);
 }).catch((e) => { console.error('init failed:', e); process.exit(1); });
