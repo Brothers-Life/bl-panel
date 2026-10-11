@@ -133,3 +133,16 @@ CREATE TABLE IF NOT EXISTS perf_metrics (
   value DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS idx_perf_ts ON perf_metrics (metric, ts DESC);
+
+CREATE TABLE IF NOT EXISTS alerts (
+  id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  kind TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'warn',
+  title TEXT NOT NULL,
+  detail TEXT,
+  citizenid TEXT,
+  data JSONB,
+  notified BOOLEAN DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts (ts DESC);
