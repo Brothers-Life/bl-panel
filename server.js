@@ -4,7 +4,8 @@
  *  - POST /v1/batch           : ingestion FiveM (Bearer INGEST_TOKEN)
  *  - GET  /api/*              : donnees pour le panel (cle PANEL_API_KEY ; la connexion Discord est geree par le panel)
  *  - /api/panel-users         : stockage des comptes du panel (voir panel-users.js)
- *  - journal joueur, recherche, origine d'un saut d'argent, inflation, scripts, annonces : voir features.js
+ *  - journal joueur, recherche, origine d'un saut d'argent, inflation, scripts, annonces, staff : voir features.js
+ *  - performances (FPS joueurs, MLO, profiler, recommandations) : voir perf.js
  *  - GET  /                   : site (public/)
  *  - GET  /api/stream         : flux temps reel (Server-Sent Events)
  *  - Scraper /perf/ + /dynamic.json toutes les 15 s, retention RETENTION_DAYS.
@@ -123,6 +124,7 @@ async function handleDbSnapshot(d) {
 async function handleEvent(ev) {
   const d = ev.data || {};
   if (ev.type === 'db_snapshot') return handleDbSnapshot(d); // volumineux : pas recopie dans events
+  if (await perfMod.ingest(ev.type, d)) return;            // performances : tables dediees
   const cid = ev.citizenid || d.citizenid || null;
   const name = ev.player_name || d.player_name || null;
   await q('INSERT INTO events (ts, type, subtype, citizenid, player_name, src, data) VALUES (to_timestamp($1/1000.0), $2, $3, $4, $5, $6, $7)',
@@ -245,10 +247,13 @@ async function scrapeOnce() {
 const RETENTION = {
   server_logs: parseInt(process.env.RETENTION_LOGS_DAYS || '30', 10),
   perf_metrics: parseInt(process.env.RETENTION_PERF_DAYS || '90', 10),
+  perf_windows: parseInt(process.env.RETENTION_PERF_DAYS || '90', 10),
+  perf_buckets: parseInt(process.env.RETENTION_PERF_DAYS || '90', 10),
+  profiler_runs: parseInt(process.env.RETENTION_PERF_DAYS || '90', 10),
   player_snapshots: parseInt(process.env.RETENTION_SNAPSHOTS_DAYS || '180', 10),
 };
 async function purgeOld() {
-  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned', 'alerts', 'db_table_stats', 'commands']) {
+  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned', 'alerts', 'db_table_stats', 'commands', 'perf_windows', 'perf_buckets', 'profiler_runs']) {
     const days = RETENTION[t] || RETENTION_DAYS;
     // Par paquets de 50 000 lignes pour ne pas bloquer la base.
     for (let i = 0; i < 400; i++) {
@@ -627,6 +632,8 @@ function serveStatic(res, urlPath) {
 const panelUsers = require('./panel-users')({ q, json, readBody });
 const features = require('./features')({ q, json, readBody, tz: PANEL_TZ });
 Object.assign(api, features.api);
+const perfMod = require('./perf')({ q });
+Object.assign(api, perfMod.api);
 if (!PANEL_API_KEY) console.warn('[api] PANEL_API_KEY absente : les routes /api/* sont PUBLIQUES.');
 
 const server = http.createServer(async (req, res) => {
@@ -641,7 +648,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url === '/v1/batch') {
       if (!ingestAuthorized(req)) return json(res, 401, { error: 'unauthorized' });
       const raw = await readBody(req);
-      return json(res, 200, await handleBatch(JSON.parse(raw.toString('utf8'))));
+      const batch = JSON.parse(raw.toString('utf8'));
+      const out = await handleBatch(batch);
+      // bl_telemetry 1.3+ : résultats des annonces dans le lot, nouvelles annonces dans la réponse (?commands=1).
+      if (Array.isArray(batch.acks)) for (const a of batch.acks.slice(0, 50)) await features.commands.ack(a.id, a.ok, a.result);
+      if (/[?&]commands=1\b/.test(req.url)) out.commands = await features.commands.pull();
+      return json(res, 200, out);
     }
 
     // Ordres du panel (annonces) relevés par bl_telemetry.

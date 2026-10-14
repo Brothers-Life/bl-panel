@@ -201,3 +201,36 @@ CREATE TABLE IF NOT EXISTS commands (
   result TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands (status, id);
+
+CREATE TABLE IF NOT EXISTS perf_windows (
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  window_s INT,
+  players_online INT,
+  n INT,
+  fps REAL,
+  fps_min REAL,
+  worst REAL,
+  hist JSONB,
+  entities JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_perf_windows_ts ON perf_windows (ts DESC);
+
+CREATE TABLE IF NOT EXISTS perf_buckets (
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  kind TEXT NOT NULL,            -- zone | interior | player
+  key TEXT NOT NULL,
+  label TEXT,
+  n INT, fps REAL, fps_min REAL, worst REAL, obj REAL, peds REAL, veh REAL,
+  x REAL, y REAL, z REAL, players INT, ping INT
+);
+CREATE INDEX IF NOT EXISTS idx_perf_buckets_kind_ts ON perf_buckets (kind, ts DESC);
+
+CREATE TABLE IF NOT EXISTS profiler_runs (
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  span_ms REAL,
+  total_ms REAL,
+  frames INT,
+  resources JSONB,
+  top JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_profiler_runs_ts ON profiler_runs (ts DESC);
