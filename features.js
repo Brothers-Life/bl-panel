@@ -8,6 +8,7 @@
  *   GET  /api/inflation?d=              masse monétaire par jour, flux par type, fortune médiane
  *   GET  /api/scripts                   erreurs par ressource, ralentissements, état des ressources
  *   GET  /api/commands, POST /api/commands   annonces envoyées au serveur (exécutées par bl_telemetry)
+ *   GET  /api/staff?days=&staff=&cat=&q=     qui fait quoi : actions staff (txAdmin, tables d'admin du jeu, panel)
  * Côté FiveM (jeton INGEST_TOKEN) : GET /v1/commands, POST /v1/commands/:id/ack
  */
 
@@ -148,6 +149,79 @@ module.exports = function createFeatures({ q, json, readBody, tz }) {
     };
   }
 
+  /* ------------------------------- suivi staff ------------------------------- */
+  // Tables du jeu qui journalisent des actions staff (suivies par bl_telemetry/live.lua).
+  const STAFF_TABLES = ['admindash_audit_log', 'admindash_sanctions', 'admindash_role_actions', 'admindash_staff_sessions',
+    'admindash_blip_logs', 'admindash_staff_loans', 'teleport_admin_logs', 'garage_admin_logs', 'job_admin_logs', 'shop_admin_logs',
+    'shop_admin', 'mapeditor_audit', 'dj_audit', 'tv_admin_logs', 'qbx_vehicle_admin_probe', 'bl_safezones_audit', 'mdt_audit'];
+  const ACTOR_KEYS = ['admin_name', 'admin', 'staff', 'staff_name', 'author', 'by', 'executor', 'moderator', 'bannedby', 'banned_by',
+    'created_by', 'actor', 'admin_label', 'officer', 'officer_name', 'user', 'username'];
+  const ACTION_KEYS = ['action', 'type', 'event', 'command', 'category', 'kind', 'log_type', 'what'];
+  const TARGET_KEYS = ['target_name', 'target', 'target_label', 'player_name', 'player', 'charname', 'name'];
+  const CATEGORIES = [
+    ['unban', /unban|revok|annul/i], ['ban', /ban(?!k)/i], ['kick', /kick|expuls/i], ['warn', /warn|avert/i],
+    ['tp', /\btp|teleport|goto|bring|tpm|tp_|_tp/i], ['soin', /heal|revive|soin|reanim/i], ['spectate', /spectat|\bspec/i],
+    ['noclip', /noclip|invis/i], ['freeze', /freeze|gel/i], ['prison', /jail|prison/i],
+    ['argent / objets', /give|additem|add_item|setmoney|money|bank_|cash|item/i], ['véhicule', /vehic|car\b|garage|spawn|plate|plaque/i],
+    ['annonce', /announce|annonce|direct_message|message/i], ['service', /duty|session|service|login|logout/i],
+    ['serveur', /shutdown|restart|whitelist/i], ['accès panel', /panel_access/i],
+  ];
+  const pick = (d, keys) => { for (const k of keys) { const v = d?.[k]; if (v != null && v !== '' && typeof v !== 'object') return String(v); } return null; };
+  const categorize = (text) => (CATEGORIES.find(([, re]) => re.test(text)) || ['autre'])[0];
+
+  async function staff(url) {
+    const p = params(url);
+    const days = clampInt(p.get('days'), 7, 1, 90);
+    const [ev, cmds, access] = await Promise.all([
+      q(`SELECT ts, type, subtype, citizenid, player_name, data FROM events
+         WHERE ts > now() - make_interval(days => $1)
+           AND (type = 'admin_action' OR (type = 'game_log' AND subtype = ANY($2)))
+         ORDER BY ts DESC LIMIT 3000`, [days, STAFF_TABLES]),
+      q(`SELECT ts, author, payload FROM commands WHERE ts > now() - make_interval(days => $1) ORDER BY ts DESC LIMIT 200`, [days]),
+      q(`SELECT updated_at AS ts, added_by, discord_id, global_name, username, access FROM panel_users
+         WHERE updated_at > now() - make_interval(days => $1) AND added_by IS NOT NULL`, [days]),
+    ]);
+    const items = [];
+    for (const r of ev.rows) {
+      const d = r.data || {};
+      const isTx = r.type === 'admin_action';
+      const action = pick(d, ACTION_KEYS) || (isTx ? '?' : r.subtype);
+      const source = isTx ? (d.source || (String(action).startsWith('bank_') ? 'banque' : 'txAdmin')) : r.subtype;
+      items.push({
+        ts: r.ts, source, action,
+        category: r.subtype === 'teleport_admin_logs' ? 'tp' : categorize(`${r.subtype || ''} ${action}`),
+        actor: pick(d, ACTOR_KEYS) || (isTx ? null : r.player_name) || '?',
+        target: pick(d, TARGET_KEYS) || (isTx ? null : null),
+        targetCid: d.target_cid || (isTx ? r.citizenid : r.citizenid) || null,
+        reason: pick(d, ['reason', 'raison', 'details', 'message', 'note', 'description']),
+        duration: pick(d, ['duration', 'durée', 'expire']),
+      });
+    }
+    for (const c of cmds.rows) items.push({ ts: c.ts, source: 'panel', action: 'annonce', category: 'annonce', actor: c.author || '?', target: 'tous les joueurs', reason: c.payload?.message || null });
+    for (const a of access.rows) items.push({ ts: a.ts, source: 'panel', action: a.access === 'granted' ? 'accès accordé' : a.access === 'revoked' ? 'accès retiré' : 'accès auto', category: 'accès panel', actor: a.added_by, target: a.global_name || a.username || a.discord_id, reason: null });
+    items.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+
+    // Classements sur toute la période, puis filtres pour la liste.
+    const byActor = new Map(), byCat = {}, byDay = {};
+    for (const it of items) {
+      const a = byActor.get(it.actor) || { actor: it.actor, total: 0, cats: {}, last: it.ts, sources: new Set() };
+      a.total++; a.cats[it.category] = (a.cats[it.category] || 0) + 1; a.sources.add(it.source);
+      if (new Date(it.ts) > new Date(a.last)) a.last = it.ts;
+      byActor.set(it.actor, a);
+      byCat[it.category] = (byCat[it.category] || 0) + 1;
+      const day = new Date(it.ts).toISOString().slice(0, 10);
+      byDay[day] = (byDay[day] || 0) + 1;
+    }
+    const fStaff = p.get('staff'), fCat = p.get('cat'), fq = (p.get('q') || '').toLowerCase().slice(0, 80);
+    const list = items.filter((it) => (!fStaff || it.actor === fStaff) && (!fCat || it.category === fCat)
+      && (!fq || [it.actor, it.action, it.target, it.reason, it.source].some((v) => String(v || '').toLowerCase().includes(fq))));
+    return {
+      days, total: items.length, truncated: ev.rows.length >= 3000,
+      staff: [...byActor.values()].map((a) => ({ ...a, sources: [...a.sources] })).sort((a, b) => b.total - a.total),
+      categories: byCat, days_activity: byDay, items: list.slice(0, 500),
+    };
+  }
+
   /* ------------------------------- annonces ------------------------------- */
   async function listCommands() {
     const r = await q(`SELECT id, ts, type, payload, author, status, sent_at, done_at, result FROM commands ORDER BY id DESC LIMIT 50`);
@@ -170,22 +244,29 @@ module.exports = function createFeatures({ q, json, readBody, tz }) {
   }
 
   // FiveM : récupère les ordres en attente (les plus vieux de 10 min expirent).
-  async function pullCommands(res) {
+  async function pull() {
     await q(`UPDATE commands SET status = 'expired' WHERE status = 'pending' AND ts < now() - interval '10 minutes'`);
     const r = await q(`UPDATE commands SET status = 'sent', sent_at = now()
                        WHERE id IN (SELECT id FROM commands WHERE status = 'pending' ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED)
                        RETURNING id, type, payload`);
-    return json(res, 200, { commands: r.rows });
+    return r.rows;
   }
+  async function ack(id, ok, result) {
+    if (!/^\d+$/.test(String(id))) return;
+    await q(`UPDATE commands SET status = $2, done_at = now(), result = $3 WHERE id = $1 AND status = 'sent'`,
+      [id, ok ? 'done' : 'failed', String(result || '').slice(0, 300)]);
+  }
+  async function pullCommands(res) { return json(res, 200, { commands: await pull() }); }
   async function ackCommand(req, res, id) {
     const b = (await body(req)) || {};
-    await q(`UPDATE commands SET status = $2, done_at = now(), result = $3 WHERE id = $1 AND status = 'sent'`,
-      [id, b.ok ? 'done' : 'failed', String(b.result || '').slice(0, 300)]);
+    await ack(id, b.ok, b.result);
     return json(res, 200, { ok: true });
   }
 
   return {
-    api: { timeline, linked, search, trace, inflation, scripts },
+    api: { timeline, linked, search, trace, inflation, scripts, staff },
+    // Utilisés par /v1/batch : bl_telemetry 1.3+ reçoit les ordres dans la réponse et renvoie les résultats avec l'envoi suivant.
+    commands: { pull, ack },
     // Routes panel avec méthode (POST) : renvoie true si traitée.
     async handlePanel(req, res, url) {
       if (url !== '/api/commands') return false;

@@ -641,7 +641,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url === '/v1/batch') {
       if (!ingestAuthorized(req)) return json(res, 401, { error: 'unauthorized' });
       const raw = await readBody(req);
-      return json(res, 200, await handleBatch(JSON.parse(raw.toString('utf8'))));
+      const batch = JSON.parse(raw.toString('utf8'));
+      const out = await handleBatch(batch);
+      // bl_telemetry 1.3+ : résultats des annonces dans le lot, nouvelles annonces dans la réponse (?commands=1).
+      if (Array.isArray(batch.acks)) for (const a of batch.acks.slice(0, 50)) await features.commands.ack(a.id, a.ok, a.result);
+      if (/[?&]commands=1\b/.test(req.url)) out.commands = await features.commands.pull();
+      return json(res, 200, out);
     }
 
     // Ordres du panel (annonces) relevés par bl_telemetry.
