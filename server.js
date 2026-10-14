@@ -2,8 +2,8 @@
 /*
  * bl-panel — panel de telemetrie Brothers Life (site + API), un seul service.
  *  - POST /v1/batch           : ingestion FiveM (Bearer INGEST_TOKEN)
- *  - GET  /api/*              : stats pour le site (connexion Discord, voir auth.js)
- *  - GET  /auth/discord       : connexion Discord (OAuth2), /auth/logout pour se deconnecter
+ *  - GET  /api/*              : donnees pour le panel (cle PANEL_API_KEY ; la connexion Discord est geree par le panel)
+ *  - /api/panel-users         : stockage des comptes du panel (voir panel-users.js)
  *  - GET  /                   : site (public/)
  *  - GET  /api/stream         : flux temps reel (Server-Sent Events)
  *  - Scraper /perf/ + /dynamic.json toutes les 15 s, retention RETENTION_DAYS.
@@ -25,8 +25,7 @@ try {
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const TOKEN = process.env.INGEST_TOKEN || '';
-const PANEL_URL = (process.env.PANEL_URL || '').replace(/\/$/, '');
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.createHash('sha256').update('bl-panel-session:' + TOKEN).digest('hex');
+const PANEL_API_KEY = process.env.PANEL_API_KEY || '';
 const FIVEM_BASE = (process.env.FIVEM_BASE || '').replace(/\/$/, '');
 const SCRAPE_INTERVAL_MS = parseInt(process.env.SCRAPE_INTERVAL_MS || '15000', 10);
 const RETENTION_DAYS = parseInt(process.env.RETENTION_DAYS || '365', 10);
@@ -70,16 +69,21 @@ function readBody(req) {
   });
 }
 
-// Avec PANEL_URL, seul le panel peut appeler l'API, cookies de session compris.
-const CORS_HEADERS = PANEL_URL
-  ? { 'Access-Control-Allow-Origin': new URL(PANEL_URL).origin, 'Access-Control-Allow-Credentials': 'true', Vary: 'Origin' }
-  : { 'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*' };
+const CORS_HEADERS = { 'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*' };
 function json(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS_HEADERS });
   res.end(JSON.stringify(obj));
 }
 
 /* --------------------------------- auth --------------------------------- */
+
+// Seul le panel lit l'API : il envoie la cle partagee PANEL_API_KEY dans l'en-tete X-Panel-Key.
+function panelAuthorized(req) {
+  if (!PANEL_API_KEY) return true;
+  const got = Buffer.from(String(req.headers['x-panel-key'] || ''));
+  const ref = Buffer.from(PANEL_API_KEY);
+  return got.length === ref.length && crypto.timingSafeEqual(got, ref);
+}
 
 function ingestAuthorized(req) {
   const h = req.headers['authorization'] || '';
@@ -585,7 +589,8 @@ function serveStatic(res, urlPath) {
 
 /* --------------------------------- serveur -------------------------------- */
 
-const auth = require('./auth')({ q, json, readBody, panelUrl: PANEL_URL, secret: SESSION_SECRET });
+const panelUsers = require('./panel-users')({ q, json, readBody });
+if (!PANEL_API_KEY) console.warn('[api] PANEL_API_KEY absente : les routes /api/* sont PUBLIQUES.');
 
 const server = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
@@ -602,10 +607,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await handleBatch(JSON.parse(raw.toString('utf8'))));
     }
 
-    if (await auth.handle(req, res, url)) return;
-
-    // Tout le reste de l'API demande une connexion (si elle est configuree).
-    if (url.startsWith('/api/') && !(await auth.guard(req, res))) return;
+    if (url.startsWith('/api/')) {
+      if (!panelAuthorized(req)) return json(res, 401, { error: 'réservé au panel' });
+      if (url === '/api/panel-users' || url.startsWith('/api/panel-users/')) return panelUsers(req, res, url);
+    }
 
     if (req.method === 'GET' && url === '/api/stream') return openStream(req, res);
 
