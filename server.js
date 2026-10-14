@@ -2,7 +2,8 @@
 /*
  * bl-panel — panel de telemetrie Brothers Life (site + API), un seul service.
  *  - POST /v1/batch           : ingestion FiveM (Bearer INGEST_TOKEN)
- *  - GET  /api/*              : stats pour le site (session cookie apres /api/login)
+ *  - GET  /api/*              : stats pour le site (connexion Discord, voir auth.js)
+ *  - GET  /auth/discord       : connexion Discord (OAuth2), /auth/logout pour se deconnecter
  *  - GET  /                   : site (public/)
  *  - GET  /api/stream         : flux temps reel (Server-Sent Events)
  *  - Scraper /perf/ + /dynamic.json toutes les 15 s, retention RETENTION_DAYS.
@@ -14,9 +15,18 @@ const path = require('path');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
+// Charge le fichier .env s'il existe (sans dependance) ; les variables deja definies gardent la priorite.
+try {
+  for (const line of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+    if (m && !line.trim().startsWith('#') && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
+  }
+} catch { /* pas de .env : variables d'environnement de l'hebergeur */ }
+
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const TOKEN = process.env.INGEST_TOKEN || '';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const PANEL_URL = (process.env.PANEL_URL || '').replace(/\/$/, '');
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.createHash('sha256').update('bl-panel-session:' + TOKEN).digest('hex');
 const FIVEM_BASE = (process.env.FIVEM_BASE || '').replace(/\/$/, '');
 const SCRAPE_INTERVAL_MS = parseInt(process.env.SCRAPE_INTERVAL_MS || '15000', 10);
 const RETENTION_DAYS = parseInt(process.env.RETENTION_DAYS || '365', 10);
@@ -60,24 +70,17 @@ function readBody(req) {
   });
 }
 
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+// Avec PANEL_URL, seul le panel peut appeler l'API, cookies de session compris.
+const CORS_HEADERS = PANEL_URL
+  ? { 'Access-Control-Allow-Origin': new URL(PANEL_URL).origin, 'Access-Control-Allow-Credentials': 'true', Vary: 'Origin' }
+  : { 'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*' };
 function json(res, code, obj) {
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': CORS_ORIGIN });
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS_HEADERS });
   res.end(JSON.stringify(obj));
 }
 
 /* --------------------------------- auth --------------------------------- */
 
-function sign(v) { return crypto.createHmac('sha256', TOKEN).update(v).digest('hex'); }
-function makeSession() { const exp = Date.now() + 7 * 86400e3; return exp + '.' + sign('sess' + exp); }
-function sessionValid(cookieHeader) {
-  const m = /(?:^|;\s*)blp=([^;]+)/.exec(cookieHeader || '');
-  if (!m) return false;
-  const [exp, sig] = m[1].split('.');
-  if (!exp || !sig) return false;
-  if (Date.now() > Number(exp)) return false;
-  try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(sign('sess' + exp))); } catch { return false; }
-}
 function ingestAuthorized(req) {
   const h = req.headers['authorization'] || '';
   if (h.startsWith('Bearer ')) return h.slice(7) === TOKEN;
@@ -377,7 +380,7 @@ function openStream(req, res) {
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
-    'Access-Control-Allow-Origin': CORS_ORIGIN,
+    ...CORS_HEADERS,
   });
   res.write('retry: 5000\n: ok\n\n');
   streamClients.add(res);
@@ -582,11 +585,13 @@ function serveStatic(res, urlPath) {
 
 /* --------------------------------- serveur -------------------------------- */
 
+const auth = require('./auth')({ q, json, readBody, panelUrl: PANEL_URL, secret: SESSION_SECRET });
+
 const server = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
   try {
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, { 'Access-Control-Allow-Origin': CORS_ORIGIN, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Max-Age': '86400' });
+      res.writeHead(204, { ...CORS_HEADERS, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Max-Age': '86400' });
       return res.end();
     }
     if (req.method === 'GET' && url === '/health') return json(res, 200, { ok: true, lastScrapeOk });
@@ -597,18 +602,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await handleBatch(JSON.parse(raw.toString('utf8'))));
     }
 
-    if (req.method === 'POST' && url === '/api/login') {
-      const raw = await readBody(req);
-      let pass = '';
-      try { pass = JSON.parse(raw.toString('utf8')).password || ''; } catch {}
-      const okBuf = Buffer.from(sign('pw' + pass));
-      const refBuf = Buffer.from(sign('pw' + ADMIN_PASSWORD));
-      if (okBuf.length === refBuf.length && crypto.timingSafeEqual(okBuf, refBuf)) {
-        res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': `blp=${makeSession()}; HttpOnly; Secure; Path=/; Max-Age=${7 * 86400}; SameSite=Lax` });
-        res.end(JSON.stringify({ ok: true }));
-      } else json(res, 401, { error: 'mauvais mot de passe' });
-      return;
-    }
+    if (await auth.handle(req, res, url)) return;
+
+    // Tout le reste de l'API demande une connexion (si elle est configuree).
+    if (url.startsWith('/api/') && !(await auth.guard(req, res))) return;
 
     if (req.method === 'GET' && url === '/api/stream') return openStream(req, res);
 

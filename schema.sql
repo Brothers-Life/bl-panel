@@ -164,3 +164,27 @@ CREATE TABLE IF NOT EXISTS db_table_stats (
   bytes BIGINT
 );
 CREATE INDEX IF NOT EXISTS idx_dbstats_ts ON db_table_stats (ts DESC);
+
+CREATE TABLE IF NOT EXISTS panel_users (
+  discord_id TEXT PRIMARY KEY,
+  username TEXT,
+  global_name TEXT,
+  avatar TEXT,
+  access TEXT,                 -- 'granted' | 'revoked' | NULL (selon les rôles Discord)
+  role_ok BOOLEAN DEFAULT false,
+  first_login TIMESTAMPTZ,
+  last_login TIMESTAMPTZ,
+  added_by TEXT,
+  note TEXT,
+  updated_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS panel_logins (
+  id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  discord_id TEXT,
+  username TEXT,
+  allowed BOOLEAN,
+  ip TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_panel_logins_ts ON panel_logins (ts DESC);
