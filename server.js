@@ -2,7 +2,8 @@
 /*
  * bl-panel — panel de telemetrie Brothers Life (site + API), un seul service.
  *  - POST /v1/batch           : ingestion FiveM (Bearer INGEST_TOKEN)
- *  - GET  /api/*              : stats pour le site (session cookie apres /api/login)
+ *  - GET  /api/*              : donnees pour le panel (cle PANEL_API_KEY ; la connexion Discord est geree par le panel)
+ *  - /api/panel-users         : stockage des comptes du panel (voir panel-users.js)
  *  - GET  /                   : site (public/)
  *  - GET  /api/stream         : flux temps reel (Server-Sent Events)
  *  - Scraper /perf/ + /dynamic.json toutes les 15 s, retention RETENTION_DAYS.
@@ -14,9 +15,17 @@ const path = require('path');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
+// Charge le fichier .env s'il existe (sans dependance) ; les variables deja definies gardent la priorite.
+try {
+  for (const line of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+    if (m && !line.trim().startsWith('#') && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
+  }
+} catch { /* pas de .env : variables d'environnement de l'hebergeur */ }
+
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const TOKEN = process.env.INGEST_TOKEN || '';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const PANEL_API_KEY = process.env.PANEL_API_KEY || '';
 const FIVEM_BASE = (process.env.FIVEM_BASE || '').replace(/\/$/, '');
 const SCRAPE_INTERVAL_MS = parseInt(process.env.SCRAPE_INTERVAL_MS || '15000', 10);
 const RETENTION_DAYS = parseInt(process.env.RETENTION_DAYS || '365', 10);
@@ -60,24 +69,22 @@ function readBody(req) {
   });
 }
 
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const CORS_HEADERS = { 'Access-Control-Allow-Origin': process.env.CORS_ORIGIN || '*' };
 function json(res, code, obj) {
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': CORS_ORIGIN });
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS_HEADERS });
   res.end(JSON.stringify(obj));
 }
 
 /* --------------------------------- auth --------------------------------- */
 
-function sign(v) { return crypto.createHmac('sha256', TOKEN).update(v).digest('hex'); }
-function makeSession() { const exp = Date.now() + 7 * 86400e3; return exp + '.' + sign('sess' + exp); }
-function sessionValid(cookieHeader) {
-  const m = /(?:^|;\s*)blp=([^;]+)/.exec(cookieHeader || '');
-  if (!m) return false;
-  const [exp, sig] = m[1].split('.');
-  if (!exp || !sig) return false;
-  if (Date.now() > Number(exp)) return false;
-  try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(sign('sess' + exp))); } catch { return false; }
+// Seul le panel lit l'API : il envoie la cle partagee PANEL_API_KEY dans l'en-tete X-Panel-Key.
+function panelAuthorized(req) {
+  if (!PANEL_API_KEY) return true;
+  const got = Buffer.from(String(req.headers['x-panel-key'] || ''));
+  const ref = Buffer.from(PANEL_API_KEY);
+  return got.length === ref.length && crypto.timingSafeEqual(got, ref);
 }
+
 function ingestAuthorized(req) {
   const h = req.headers['authorization'] || '';
   if (h.startsWith('Bearer ')) return h.slice(7) === TOKEN;
@@ -89,13 +96,54 @@ function ingestAuthorized(req) {
 
 /* ------------------------------- ingestion ------------------------------- */
 
+const anticheatCooldown = new Map();
+
+/* Resultats de lecture de la base du jeu (bl_telemetry/dbsync) : on garde la derniere version de chacun. */
+async function handleDbSnapshot(d) {
+  const name = String(d.name || '');
+  if (!/^[\w-]{1,60}$/.test(name) || !Array.isArray(d.rows) || !Array.isArray(d.columns)) return;
+  const rows = d.rows.slice(0, 500);
+  const columns = d.columns.slice(0, 30).map((c) => String(c).slice(0, 60));
+  await q(`INSERT INTO db_snapshots (name, label, kind, pos, ts, columns, rows) VALUES ($1, $2, $3, $4, now(), $5, $6)
+           ON CONFLICT (name) DO UPDATE SET label = EXCLUDED.label, kind = EXCLUDED.kind, pos = EXCLUDED.pos, ts = now(),
+             columns = EXCLUDED.columns, rows = EXCLUDED.rows`,
+    [name, String(d.label || name).slice(0, 120), String(d.kind || 'table').slice(0, 20), Number.isInteger(d.pos) ? d.pos : null,
+      JSON.stringify(columns), JSON.stringify(rows)]);
+  if (name === '_tables') {
+    for (const [t, n, b] of rows) {
+      await q('INSERT INTO db_table_stats (table_name, rows, bytes) VALUES ($1, $2, $3)', [String(t).slice(0, 120), num(n), num(b)]);
+    }
+  }
+}
+
 async function handleEvent(ev) {
   const d = ev.data || {};
+  if (ev.type === 'db_snapshot') return handleDbSnapshot(d); // volumineux : pas recopie dans events
   const cid = ev.citizenid || d.citizenid || null;
   const name = ev.player_name || d.player_name || null;
   await q('INSERT INTO events (ts, type, subtype, citizenid, player_name, src, data) VALUES (to_timestamp($1/1000.0), $2, $3, $4, $5, $6, $7)',
     [ev.ts || Date.now(), ev.type || 'unknown', ev.subtype || null, cid, name, ev.src || null, JSON.stringify(d)]);
+  if (ev.subtype === 'character_loaded' && (d.license || ev.src)) {
+    // Rattache la session ouverte (creee a la connexion, sans personnage) au personnage charge.
+    await q(`UPDATE sessions SET citizenid = $1, player_name = COALESCE($2, player_name)
+       WHERE id = (SELECT id FROM sessions WHERE end_ts IS NULL AND citizenid IS NULL
+                   AND (license = $3 OR ($3 IS NULL AND src = $4)) ORDER BY start_ts DESC LIMIT 1)`,
+      [cid, name, d.license || null, ev.src || null]);
+  }
   switch (ev.type) {
+    case 'anticheat': {
+      const reason = String(d.reason || 'détection').slice(0, 120);
+      const key = (cid || ev.src || '?') + ':' + reason;
+      if (Date.now() - (anticheatCooldown.get(key) || 0) > 2 * 60e3) {
+        anticheatCooldown.set(key, Date.now());
+        const details = d.details && typeof d.details === 'object'
+          ? Object.entries(d.details).map(([k, v]) => `${k} : ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n')
+          : '';
+        await raiseAlert('anticheat', 'critical', `Anticheat : ${name || cid || 'joueur ' + (ev.src ?? '?')} — ${reason}`,
+          (cid ? `citizenid ${cid}\n` : '') + details, cid, d);
+      }
+      break;
+    }
     case 'economy_snapshot':
       await q('INSERT INTO economy_snapshots (ts, player_count, chars_total, total_cash, total_bank, total_crypto, society_total, data) VALUES (to_timestamp($1/1000.0), $2, $3, $4, $5, $6, $7, $8)',
         [ev.ts || Date.now(), d.player_count, d.chars_total, num(d.total_cash), num(d.total_bank), num(d.total_crypto), num(d.society_total), JSON.stringify(d.extra || {})]);
@@ -190,7 +238,7 @@ async function scrapeOnce() {
 }
 
 async function purgeOld() {
-  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned', 'alerts']) {
+  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned', 'alerts', 'db_table_stats']) {
     await q(`DELETE FROM ${t} WHERE ts < now() - interval '${RETENTION_DAYS} days'`);
   }
 }
@@ -336,7 +384,7 @@ function openStream(req, res) {
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
-    'Access-Control-Allow-Origin': CORS_ORIGIN,
+    ...CORS_HEADERS,
   });
   res.write('retry: 5000\n: ok\n\n');
   streamClients.add(res);
@@ -447,6 +495,22 @@ const api = {
     ]);
     return { actions: actions.rows, connections: connections.rows, explosions: explosions.rows, deathsByHour: deathsByHour.rows };
   },
+  async db() {
+    const [snaps, tables, day, week] = await Promise.all([
+      q(`SELECT name, label, kind, pos, ts, columns, rows FROM db_snapshots ORDER BY pos NULLS LAST, name`),
+      q(`SELECT ts, rows FROM db_snapshots WHERE name = '_tables'`),
+      q(`SELECT DISTINCT ON (table_name) table_name, rows FROM db_table_stats WHERE ts <= now() - interval '24 hours' ORDER BY table_name, ts DESC`),
+      q(`SELECT DISTINCT ON (table_name) table_name, rows FROM db_table_stats WHERE ts <= now() - interval '7 days' ORDER BY table_name, ts DESC`),
+    ]);
+    const before = (list) => Object.fromEntries(list.rows.map((r) => [r.table_name, Number(r.rows)]));
+    const d1 = before(day), d7 = before(week);
+    const t = tables.rows[0];
+    return {
+      tablesTs: t?.ts || null,
+      tables: (t?.rows || []).map(([name, rows, bytes]) => ({ name, rows: Number(rows) || 0, bytes: Number(bytes) || 0, rows24h: d1[name] ?? null, rows7d: d7[name] ?? null })),
+      snapshots: snaps.rows.filter((r) => r.name !== '_tables'),
+    };
+  },
   async deathmap(url) {
     const h = hoursParam(url, 24 * 7);
     const [points, shots] = await Promise.all([
@@ -525,11 +589,14 @@ function serveStatic(res, urlPath) {
 
 /* --------------------------------- serveur -------------------------------- */
 
+const panelUsers = require('./panel-users')({ q, json, readBody });
+if (!PANEL_API_KEY) console.warn('[api] PANEL_API_KEY absente : les routes /api/* sont PUBLIQUES.');
+
 const server = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
   try {
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, { 'Access-Control-Allow-Origin': CORS_ORIGIN, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Max-Age': '86400' });
+      res.writeHead(204, { ...CORS_HEADERS, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Max-Age': '86400' });
       return res.end();
     }
     if (req.method === 'GET' && url === '/health') return json(res, 200, { ok: true, lastScrapeOk });
@@ -540,17 +607,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await handleBatch(JSON.parse(raw.toString('utf8'))));
     }
 
-    if (req.method === 'POST' && url === '/api/login') {
-      const raw = await readBody(req);
-      let pass = '';
-      try { pass = JSON.parse(raw.toString('utf8')).password || ''; } catch {}
-      const okBuf = Buffer.from(sign('pw' + pass));
-      const refBuf = Buffer.from(sign('pw' + ADMIN_PASSWORD));
-      if (okBuf.length === refBuf.length && crypto.timingSafeEqual(okBuf, refBuf)) {
-        res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': `blp=${makeSession()}; HttpOnly; Secure; Path=/; Max-Age=${7 * 86400}; SameSite=Lax` });
-        res.end(JSON.stringify({ ok: true }));
-      } else json(res, 401, { error: 'mauvais mot de passe' });
-      return;
+    if (url.startsWith('/api/')) {
+      if (!panelAuthorized(req)) return json(res, 401, { error: 'réservé au panel' });
+      if (url === '/api/panel-users' || url.startsWith('/api/panel-users/')) return panelUsers(req, res, url);
     }
 
     if (req.method === 'GET' && url === '/api/stream') return openStream(req, res);
