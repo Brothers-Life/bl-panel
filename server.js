@@ -91,8 +91,27 @@ function ingestAuthorized(req) {
 
 const anticheatCooldown = new Map();
 
+/* Resultats de lecture de la base du jeu (bl_telemetry/dbsync) : on garde la derniere version de chacun. */
+async function handleDbSnapshot(d) {
+  const name = String(d.name || '');
+  if (!/^[\w-]{1,60}$/.test(name) || !Array.isArray(d.rows) || !Array.isArray(d.columns)) return;
+  const rows = d.rows.slice(0, 500);
+  const columns = d.columns.slice(0, 30).map((c) => String(c).slice(0, 60));
+  await q(`INSERT INTO db_snapshots (name, label, kind, pos, ts, columns, rows) VALUES ($1, $2, $3, $4, now(), $5, $6)
+           ON CONFLICT (name) DO UPDATE SET label = EXCLUDED.label, kind = EXCLUDED.kind, pos = EXCLUDED.pos, ts = now(),
+             columns = EXCLUDED.columns, rows = EXCLUDED.rows`,
+    [name, String(d.label || name).slice(0, 120), String(d.kind || 'table').slice(0, 20), Number.isInteger(d.pos) ? d.pos : null,
+      JSON.stringify(columns), JSON.stringify(rows)]);
+  if (name === '_tables') {
+    for (const [t, n, b] of rows) {
+      await q('INSERT INTO db_table_stats (table_name, rows, bytes) VALUES ($1, $2, $3)', [String(t).slice(0, 120), num(n), num(b)]);
+    }
+  }
+}
+
 async function handleEvent(ev) {
   const d = ev.data || {};
+  if (ev.type === 'db_snapshot') return handleDbSnapshot(d); // volumineux : pas recopie dans events
   const cid = ev.citizenid || d.citizenid || null;
   const name = ev.player_name || d.player_name || null;
   await q('INSERT INTO events (ts, type, subtype, citizenid, player_name, src, data) VALUES (to_timestamp($1/1000.0), $2, $3, $4, $5, $6, $7)',
@@ -212,7 +231,7 @@ async function scrapeOnce() {
 }
 
 async function purgeOld() {
-  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned', 'alerts']) {
+  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned', 'alerts', 'db_table_stats']) {
     await q(`DELETE FROM ${t} WHERE ts < now() - interval '${RETENTION_DAYS} days'`);
   }
 }
@@ -468,6 +487,22 @@ const api = {
       q(`SELECT date_trunc('hour', ts) AS t, COUNT(*) AS n FROM deaths WHERE ts > now() - interval '7 days' GROUP BY 1 ORDER BY 1`),
     ]);
     return { actions: actions.rows, connections: connections.rows, explosions: explosions.rows, deathsByHour: deathsByHour.rows };
+  },
+  async db() {
+    const [snaps, tables, day, week] = await Promise.all([
+      q(`SELECT name, label, kind, pos, ts, columns, rows FROM db_snapshots ORDER BY pos NULLS LAST, name`),
+      q(`SELECT ts, rows FROM db_snapshots WHERE name = '_tables'`),
+      q(`SELECT DISTINCT ON (table_name) table_name, rows FROM db_table_stats WHERE ts <= now() - interval '24 hours' ORDER BY table_name, ts DESC`),
+      q(`SELECT DISTINCT ON (table_name) table_name, rows FROM db_table_stats WHERE ts <= now() - interval '7 days' ORDER BY table_name, ts DESC`),
+    ]);
+    const before = (list) => Object.fromEntries(list.rows.map((r) => [r.table_name, Number(r.rows)]));
+    const d1 = before(day), d7 = before(week);
+    const t = tables.rows[0];
+    return {
+      tablesTs: t?.ts || null,
+      tables: (t?.rows || []).map(([name, rows, bytes]) => ({ name, rows: Number(rows) || 0, bytes: Number(bytes) || 0, rows24h: d1[name] ?? null, rows7d: d7[name] ?? null })),
+      snapshots: snaps.rows.filter((r) => r.name !== '_tables'),
+    };
   },
   async deathmap(url) {
     const h = hoursParam(url, 24 * 7);

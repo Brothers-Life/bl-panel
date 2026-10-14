@@ -146,3 +146,21 @@ CREATE TABLE IF NOT EXISTS alerts (
   notified BOOLEAN DEFAULT false
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts (ts DESC);
+
+CREATE TABLE IF NOT EXISTS db_snapshots (
+  name TEXT PRIMARY KEY,
+  label TEXT,
+  kind TEXT,
+  pos INT,
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  columns JSONB,
+  rows JSONB
+);
+
+CREATE TABLE IF NOT EXISTS db_table_stats (
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  table_name TEXT NOT NULL,
+  rows BIGINT,
+  bytes BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_dbstats_ts ON db_table_stats (ts DESC);
