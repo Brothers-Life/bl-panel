@@ -89,13 +89,35 @@ function ingestAuthorized(req) {
 
 /* ------------------------------- ingestion ------------------------------- */
 
+const anticheatCooldown = new Map();
+
 async function handleEvent(ev) {
   const d = ev.data || {};
   const cid = ev.citizenid || d.citizenid || null;
   const name = ev.player_name || d.player_name || null;
   await q('INSERT INTO events (ts, type, subtype, citizenid, player_name, src, data) VALUES (to_timestamp($1/1000.0), $2, $3, $4, $5, $6, $7)',
     [ev.ts || Date.now(), ev.type || 'unknown', ev.subtype || null, cid, name, ev.src || null, JSON.stringify(d)]);
+  if (ev.subtype === 'character_loaded' && (d.license || ev.src)) {
+    // Rattache la session ouverte (creee a la connexion, sans personnage) au personnage charge.
+    await q(`UPDATE sessions SET citizenid = $1, player_name = COALESCE($2, player_name)
+       WHERE id = (SELECT id FROM sessions WHERE end_ts IS NULL AND citizenid IS NULL
+                   AND (license = $3 OR ($3 IS NULL AND src = $4)) ORDER BY start_ts DESC LIMIT 1)`,
+      [cid, name, d.license || null, ev.src || null]);
+  }
   switch (ev.type) {
+    case 'anticheat': {
+      const reason = String(d.reason || 'détection').slice(0, 120);
+      const key = (cid || ev.src || '?') + ':' + reason;
+      if (Date.now() - (anticheatCooldown.get(key) || 0) > 2 * 60e3) {
+        anticheatCooldown.set(key, Date.now());
+        const details = d.details && typeof d.details === 'object'
+          ? Object.entries(d.details).map(([k, v]) => `${k} : ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n')
+          : '';
+        await raiseAlert('anticheat', 'critical', `Anticheat : ${name || cid || 'joueur ' + (ev.src ?? '?')} — ${reason}`,
+          (cid ? `citizenid ${cid}\n` : '') + details, cid, d);
+      }
+      break;
+    }
     case 'economy_snapshot':
       await q('INSERT INTO economy_snapshots (ts, player_count, chars_total, total_cash, total_bank, total_crypto, society_total, data) VALUES (to_timestamp($1/1000.0), $2, $3, $4, $5, $6, $7, $8)',
         [ev.ts || Date.now(), d.player_count, d.chars_total, num(d.total_cash), num(d.total_bank), num(d.total_crypto), num(d.society_total), JSON.stringify(d.extra || {})]);
