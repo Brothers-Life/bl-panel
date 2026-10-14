@@ -188,3 +188,16 @@ CREATE TABLE IF NOT EXISTS panel_logins (
   ip TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_panel_logins_ts ON panel_logins (ts DESC);
+
+CREATE TABLE IF NOT EXISTS commands (
+  id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  type TEXT NOT NULL,
+  payload JSONB,
+  author TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending | sent | done | failed | expired
+  sent_at TIMESTAMPTZ,
+  done_at TIMESTAMPTZ,
+  result TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_commands_status ON commands (status, id);

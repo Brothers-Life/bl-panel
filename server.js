@@ -4,6 +4,7 @@
  *  - POST /v1/batch           : ingestion FiveM (Bearer INGEST_TOKEN)
  *  - GET  /api/*              : donnees pour le panel (cle PANEL_API_KEY ; la connexion Discord est geree par le panel)
  *  - /api/panel-users         : stockage des comptes du panel (voir panel-users.js)
+ *  - journal joueur, recherche, origine d'un saut d'argent, inflation, scripts, annonces : voir features.js
  *  - GET  /                   : site (public/)
  *  - GET  /api/stream         : flux temps reel (Server-Sent Events)
  *  - Scraper /perf/ + /dynamic.json toutes les 15 s, retention RETENTION_DAYS.
@@ -106,7 +107,7 @@ const anticheatCooldown = new Map();
 async function handleDbSnapshot(d) {
   const name = String(d.name || '');
   if (!/^[\w-]{1,60}$/.test(name) || !Array.isArray(d.rows) || !Array.isArray(d.columns)) return;
-  const rows = d.rows.slice(0, 500);
+  const rows = d.rows.slice(0, 5000);
   const columns = d.columns.slice(0, 30).map((c) => String(c).slice(0, 60));
   await q(`INSERT INTO db_snapshots (name, label, kind, pos, ts, columns, rows) VALUES ($1, $2, $3, $4, now(), $5, $6)
            ON CONFLICT (name) DO UPDATE SET label = EXCLUDED.label, kind = EXCLUDED.kind, pos = EXCLUDED.pos, ts = now(),
@@ -114,9 +115,8 @@ async function handleDbSnapshot(d) {
     [name, String(d.label || name).slice(0, 120), String(d.kind || 'table').slice(0, 20), Number.isInteger(d.pos) ? d.pos : null,
       JSON.stringify(columns), JSON.stringify(rows)]);
   if (name === '_tables') {
-    for (const [t, n, b] of rows) {
-      await q('INSERT INTO db_table_stats (table_name, rows, bytes) VALUES ($1, $2, $3)', [String(t).slice(0, 120), num(n), num(b)]);
-    }
+    await q(`INSERT INTO db_table_stats (table_name, rows, bytes) SELECT * FROM unnest($1::text[], $2::bigint[], $3::bigint[])`,
+      [rows.map((r) => String(r[0]).slice(0, 120)), rows.map((r) => num(r[1])), rows.map((r) => num(r[2]))]);
   }
 }
 
@@ -241,11 +241,39 @@ async function scrapeOnce() {
   }
 }
 
+// Duree de conservation par table (jours) ; les logs et mesures de perf, tres volumineux, sont gardes moins longtemps.
+const RETENTION = {
+  server_logs: parseInt(process.env.RETENTION_LOGS_DAYS || '30', 10),
+  perf_metrics: parseInt(process.env.RETENTION_PERF_DAYS || '90', 10),
+  player_snapshots: parseInt(process.env.RETENTION_SNAPSHOTS_DAYS || '180', 10),
+};
 async function purgeOld() {
-  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned', 'alerts', 'db_table_stats']) {
-    await q(`DELETE FROM ${t} WHERE ts < now() - interval '${RETENTION_DAYS} days'`);
+  for (const t of ['events', 'server_logs', 'perf_metrics', 'player_snapshots', 'economy_snapshots', 'vehicles_owned', 'alerts', 'db_table_stats', 'commands']) {
+    const days = RETENTION[t] || RETENTION_DAYS;
+    // Par paquets de 50 000 lignes pour ne pas bloquer la base.
+    for (let i = 0; i < 400; i++) {
+      const r = await q(`DELETE FROM ${t} WHERE ctid IN (SELECT ctid FROM ${t} WHERE ts < now() - make_interval(days => $1) LIMIT 50000)`, [days]);
+      if ((r.rowCount || 0) < 50000) break;
+    }
   }
 }
+
+// Index utiles aux vues du panel, crees en arriere-plan (CONCURRENTLY) pour ne jamais bloquer l'ingestion.
+async function ensureIndexes() {
+  for (const sql of [
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_subtype_ts ON events (subtype, ts DESC)`,
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_flow_from ON events ((data->>'from_cid'), ts DESC) WHERE subtype = 'bank_flow'`,
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_flow_to ON events ((data->>'to_cid'), ts DESC) WHERE subtype = 'bank_flow'`,
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_slogs_level_ts ON server_logs (level, ts DESC)`,
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_deaths_killer ON deaths (killer_cid, ts DESC)`,
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sessions_license ON sessions (license)`,
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_alerts_cid ON alerts (citizenid, ts DESC)`,
+  ]) await q(sql);
+  console.log('Index OK');
+}
+
+// Taille de tranche (s) pour renvoyer ~600 points par courbe au lieu de milliers.
+const bucketSec = (hours, min = 15) => Math.max(min, Math.round(hours * 3600 / 600));
 
 /* -------------------------------- alertes -------------------------------- */
 
@@ -415,13 +443,15 @@ function hoursParam(url, def) {
 const api = {
   async overview(url) {
     const h = hoursParam(url, 24);
+    const b = bucketSec(h);
     const [online, tick, counts, errors, up] = await Promise.all([
-      q(`SELECT extract(epoch FROM ts)*1000 AS t, value FROM perf_metrics WHERE metric='players_online' AND ts > now() - interval '${h} hours' ORDER BY ts`),
-      q(`WITH s AS (SELECT ts, thread, value v FROM perf_metrics WHERE metric='tick_sum_sec' AND ts > now() - interval '${h} hours'),
+      q(`SELECT floor(extract(epoch FROM ts) / ${b}) * ${b} * 1000 AS t, ROUND(AVG(value)::numeric, 1) AS value FROM perf_metrics
+         WHERE metric='players_online' AND ts > now() - interval '${h} hours' GROUP BY 1 ORDER BY 1`),
+      q(`SELECT floor(t / 1000 / ${b}) * ${b} * 1000 AS t, thread, AVG(ms) AS ms FROM (WITH s AS (SELECT ts, thread, value v FROM perf_metrics WHERE metric='tick_sum_sec' AND ts > now() - interval '${h} hours'),
                c AS (SELECT ts, thread, value v FROM perf_metrics WHERE metric='tick_count' AND ts > now() - interval '${h} hours')
          SELECT extract(epoch FROM s.ts)*1000 AS t, s.thread,
                 (s.v - lag(s.v) OVER (PARTITION BY s.thread ORDER BY s.ts)) / NULLIF(c.v - lag(c.v) OVER (PARTITION BY c.thread ORDER BY c.ts),0) * 1000 AS ms
-         FROM s JOIN c ON c.ts = s.ts AND c.thread = s.thread ORDER BY 1`),
+         FROM s JOIN c ON c.ts = s.ts AND c.thread = s.thread) x WHERE ms IS NOT NULL GROUP BY 1, 2 ORDER BY 1`),
       q(`SELECT
           (SELECT value FROM perf_metrics WHERE metric='players_online' ORDER BY ts DESC LIMIT 1) AS online,
           (SELECT value FROM perf_metrics WHERE metric='players_max' ORDER BY ts DESC LIMIT 1) AS max,
@@ -439,7 +469,8 @@ const api = {
   async economy(url) {
     const h = hoursParam(url, 24 * 7);
     const [mass, top, shops, purchases, flows, flowsByHour, latest, extra] = await Promise.all([
-      q(`SELECT extract(epoch FROM ts)*1000 AS t, total_cash, total_bank FROM economy_snapshots WHERE ts > now() - interval '${h} hours' ORDER BY ts`),
+      q(`SELECT floor(extract(epoch FROM ts) / ${bucketSec(h, 60)}) * ${bucketSec(h, 60)} * 1000 AS t, AVG(total_cash) AS total_cash, AVG(total_bank) AS total_bank
+         FROM economy_snapshots WHERE ts > now() - interval '${h} hours' GROUP BY 1 ORDER BY 1`),
       q(`SELECT name, citizenid, cash, bank, cash+bank AS total FROM (SELECT DISTINCT ON (citizenid) citizenid, name, cash, bank FROM player_snapshots ORDER BY citizenid, ts DESC) t ORDER BY total DESC NULLS LAST LIMIT 20`),
       q(`SELECT COALESCE(shop,'?') AS shop, SUM(total) AS ca, COUNT(*) AS n FROM purchases WHERE ts > now() - interval '${h} hours' GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 15`),
       q(`SELECT ts, player_name, citizenid, shop, COALESCE(label,item) AS article, qty, total, currency FROM purchases ORDER BY ts DESC LIMIT 100`),
@@ -512,7 +543,7 @@ const api = {
     return {
       tablesTs: t?.ts || null,
       tables: (t?.rows || []).map(([name, rows, bytes]) => ({ name, rows: Number(rows) || 0, bytes: Number(bytes) || 0, rows24h: d1[name] ?? null, rows7d: d7[name] ?? null })),
-      snapshots: snaps.rows.filter((r) => r.name !== '_tables'),
+      snapshots: snaps.rows.filter((r) => !r.name.startsWith('_') && !['hidden', 'internal'].includes(r.kind)),
     };
   },
   async deathmap(url) {
@@ -594,6 +625,8 @@ function serveStatic(res, urlPath) {
 /* --------------------------------- serveur -------------------------------- */
 
 const panelUsers = require('./panel-users')({ q, json, readBody });
+const features = require('./features')({ q, json, readBody, tz: PANEL_TZ });
+Object.assign(api, features.api);
 if (!PANEL_API_KEY) console.warn('[api] PANEL_API_KEY absente : les routes /api/* sont PUBLIQUES.');
 
 const server = http.createServer(async (req, res) => {
@@ -611,9 +644,17 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await handleBatch(JSON.parse(raw.toString('utf8'))));
     }
 
+    // Ordres du panel (annonces) relevés par bl_telemetry.
+    if (url.startsWith('/v1/commands')) {
+      if (!ingestAuthorized(req)) return json(res, 401, { error: 'unauthorized' });
+      if (await features.handleFivem(req, res, url)) return;
+      return json(res, 404, { error: 'inconnu' });
+    }
+
     if (url.startsWith('/api/')) {
       if (!panelAuthorized(req)) return json(res, 401, { error: 'réservé au panel' });
       if (url === '/api/panel-users' || url.startsWith('/api/panel-users/')) return panelUsers(req, res, url);
+      if (await features.handlePanel(req, res, url)) return;
     }
 
     if (req.method === 'GET' && url === '/api/stream') return openStream(req, res);
@@ -635,6 +676,8 @@ const server = http.createServer(async (req, res) => {
 initSchema().then(() => {
   server.listen(PORT, () => console.log('bl-panel on :' + PORT));
   if (FIVEM_BASE) { scrapeOnce(); setInterval(scrapeOnce, SCRAPE_INTERVAL_MS); }
-  purgeOld(); setInterval(purgeOld, 24 * 3600 * 1000);
+  ensureIndexes().catch((e) => console.error('index:', e.message));
+  setTimeout(() => purgeOld().catch((e) => console.error('purge:', e.message)), 60e3);
+  setInterval(() => purgeOld().catch((e) => console.error('purge:', e.message)), 24 * 3600 * 1000);
   setInterval(() => checkAlerts().catch((e) => console.error('alerts:', e.message)), ALERT_INTERVAL_MS);
 }).catch((e) => { console.error('init failed:', e); process.exit(1); });
